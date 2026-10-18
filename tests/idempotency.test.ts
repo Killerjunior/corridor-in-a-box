@@ -226,19 +226,20 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         state: params[2],
         version: params[3] as number,
         transaction_id: params[4],
-        quote_id: params[5],
-        quote_expires_at: params[6],
-        quote_firm: params[7],
-        settlement_amount: params[8],
-        stellar_tx_hash: params[9],
-        deposit_address: params[10],
-        memo: params[11],
-        memo_type: params[12],
-        refund_id: params[13],
-        last_error: params[14],
-        owner: params[15],
-        settlement: params[16],
-        manifest_hash: params[17],
+        source_transaction_id: params[5],
+        quote_id: params[6],
+        quote_expires_at: params[7],
+        quote_firm: params[8],
+        settlement_amount: params[9],
+        stellar_tx_hash: params[10],
+        deposit_address: params[11],
+        memo: params[12],
+        memo_type: params[13],
+        refund_id: params[14],
+        last_error: params[15],
+        owner: params[16],
+        settlement: params[17],
+        manifest_hash: params[18],
       };
       // create(): INSERT … ON CONFLICT DO NOTHING RETURNING — only the first
       // writer for a key lands a row and gets it back; a conflict returns [].
@@ -294,6 +295,18 @@ describe("state round-trips", () => {
     const got = await store.get("k-rp");
     expect(got?.state).toBe("refund_pending");
     expect(got?.stellarTxHash).toBe("hash_rp");
+  });
+
+  it("PostgresIdempotencyStore persists the source deposit reference", async () => {
+    const store = new PostgresIdempotencyStore(fakeDb());
+    await store.put({
+      idempotencyKey: "k-source",
+      corridorId: "c",
+      state: "funding",
+      version: 2,
+      sourceTransactionId: "source-deposit-1",
+    });
+    expect((await store.get("k-source"))?.sourceTransactionId).toBe("source-deposit-1");
   });
 });
 
@@ -403,6 +416,7 @@ describe("refund state round-trips", () => {
       "settlement_amount",
       "deposit_address",
       "manifest_hash",
+      "source_transaction_id",
     ]) {
       expect(seen[0]).toContain(column);
       expect(seen.slice(1).join("\n")).toContain(`add column if not exists ${column}`);

@@ -25,6 +25,8 @@ export interface StoredRun {
   state: CorridorState;
   version: number;
   transactionId?: string;
+  /** Source-anchor deposit transaction opened to fund the operator account. */
+  sourceTransactionId?: string;
   quoteId?: string;
   quoteExpiresAt?: number;
   quoteFirm?: boolean;

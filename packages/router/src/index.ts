@@ -7,12 +7,14 @@
 // component is included or injected here.
 
 import type { Corridor } from "@corridor/manifest";
-import type { AnchorAdapter } from "@corridor/adapter-kit";
+import type { AnchorAdapter, SourceAdapter } from "@corridor/adapter-kit";
 import type { PaymentIntent } from "@corridor/types";
 
 export interface RouteDecision {
   /** The receiving anchor chosen for this payment. */
   readonly receiving: AnchorAdapter;
+  /** Source anchor used to on-ramp the bridge asset when the corridor is not prefunded. */
+  readonly source?: SourceAdapter;
   /** Reserved for split routing across multiple anchors (weights sum to 1). */
   readonly split?: ReadonlyArray<{ adapter: AnchorAdapter; weight: number }>;
   /** How the route decision was reached: verified against on-chain evidence or assumed from manifest. */

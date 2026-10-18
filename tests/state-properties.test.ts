@@ -15,6 +15,8 @@ const ALL: CorridorState[] = [
   "quoted",
   "compliant",
   "opened",
+  "funding",
+  "funded",
   "verifying",
   "settling",
   "retrying",
@@ -141,6 +143,15 @@ describe("state machine structure", () => {
     ).toBe(false);
   });
 
+  it("recovery cannot re-enter funding or settlement", () => {
+    for (const state of ["recovering", "refund_pending"] as CorridorState[]) {
+      const reachable = reachableFrom(state);
+      expect(reachable.has("funding"), `${state} can re-enter funding`).toBe(false);
+      expect(reachable.has("funded"), `${state} can reach funded`).toBe(false);
+      expect(reachable.has("settling"), `${state} can re-enter settling`).toBe(false);
+    }
+  });
+
   it("no refund state, direct or transitive, reaches settling", () => {
     // The generalisation of the two properties above, stated once over the
     // whole refund path rather than state by state: everything the engine can
@@ -185,7 +196,7 @@ describe("state machine structure", () => {
     // with a single entrance, "did the gate run?" is answerable from the table
     // alone rather than by reading run.ts.
     const entrances = ALL.filter((s) => canTransition(s, "settling")).sort();
-    expect(entrances).toEqual(["verifying"]);
+    expect(entrances).toEqual(["funded", "verifying"]);
   });
 
   it("retrying re-enters settling only through verifying", () => {
@@ -217,11 +228,11 @@ describe("state machine structure", () => {
     // Its only successors are `settling` and `failed`: a gate refusal is a
     // terminal-bound `failed`, never `recovering`, because no money has moved
     // and there is nothing to unwind.
-    expect(successors("verifying").sort()).toEqual(["failed", "settling"]);
+    expect(successors("verifying").sort()).toEqual(["failed", "funding", "settling"]);
     expect(canTransition("verifying", "recovering")).toBe(false);
   });
 
-  it("only opened and retrying reach verifying", () => {
+  it("only opened, funded, and retrying reach verifying", () => {
     const entrances = ALL.filter((s) => canTransition(s, "verifying")).sort();
     expect(entrances).toEqual(["opened", "retrying"]);
   });

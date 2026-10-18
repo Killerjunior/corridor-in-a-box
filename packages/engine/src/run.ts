@@ -53,7 +53,7 @@ import {
   watchRefund,
   settleQuoteProblem,
 } from "./verbs";
-import type { AnchorAdapter, TransactionStatus } from "@corridor/adapter-kit";
+import type { AnchorAdapter, SourceAdapter, TransactionStatus } from "@corridor/adapter-kit";
 import { defaultStrategies } from "./ports";
 import { checkCompatibility } from "./compat";
 import {
@@ -663,6 +663,36 @@ export async function execute(
       );
     }
 
+    // The pre-settle gate has passed, so it is now safe to on-ramp the source
+    // funds. Persist the source reference before polling; a funded resume goes
+    // straight to settlement and can never open another deposit.
+    if (corridor.source.protocol !== "prefunded" && !run.sourceTransactionId) {
+      if (!route.source) {
+        return die({
+          code: "ENGINE_MISCONFIGURED",
+          message: `corridor ${corridor.id} requires a source adapter for protocol ${corridor.source.protocol}`,
+          retryable: false,
+        });
+      }
+      const funding = await advance("funding");
+      if (!funding.ok) return die(funding.error);
+      const deposit = await route.source.openDeposit(intent, corridor);
+      if (!deposit.ok) return finishFailure(deposit.error);
+      run.sourceTransactionId = deposit.value.transactionId;
+      run.version += 1;
+      await store.put(run);
+      const funded = await waitForSourceDeposit(route.source, run.sourceTransactionId, {
+        now,
+        sleep,
+        deadlineMs,
+        pollMs,
+        stallThreshold,
+      });
+      if (!funded.ok) return finishFailure(funded.error);
+      const markedFunded = await advance("funded");
+      if (!markedFunded.ok) return die(markedFunded.error);
+    }
+
     {
       const t = await advance("settling");
       if (!t.ok) return die(t.error);
@@ -751,6 +781,25 @@ export async function execute(
   await recordOutcome("completed");
   metrics.timing("corridor.duration", now() - startedAt, { corridor: corridor.id });
   return ok(toResult(run, trail));
+}
+
+async function waitForSourceDeposit(
+  source: SourceAdapter,
+  transactionId: string,
+  opts: {
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    deadlineMs: number;
+    pollMs: number;
+    stallThreshold: number;
+  },
+): Promise<Outcome<void>> {
+  const result = await reconcileUntil(
+    { getTransaction: (id) => source.getDeposit(id) },
+    transactionId,
+    opts,
+  );
+  return result.ok ? ok(undefined) : result;
 }
 
 async function emitVerification(
@@ -1201,8 +1250,33 @@ async function resumeRun(
     });
   }
 
+  if (run.state === "funding") {
+    if (!route.source) return conflict("source adapter is unavailable");
+    if (!run.sourceTransactionId) {
+      // The adapter contract requires idempotency by the run key. This covers
+      // a crash after the anchor accepted openDeposit but before we persisted
+      // the returned transaction id.
+      const deposit = await route.source.openDeposit(intent, corridor);
+      if (!deposit.ok) return context.finishFailure(deposit.error);
+      run.sourceTransactionId = deposit.value.transactionId;
+      run.version += 1;
+      await store.put(run);
+    }
+    const funded = await waitForSourceDeposit(route.source, run.sourceTransactionId, {
+      now,
+      sleep,
+      deadlineMs: now() + corridor.recovery.timeout_seconds * 1000,
+      pollMs,
+      stallThreshold,
+    });
+    if (!funded.ok) return context.finishFailure(funded.error);
+    const advanced = await context.advance("funded");
+    if (!advanced.ok) return advanced;
+  }
+
   if (
     run.state === "opened" ||
+    run.state === "funded" ||
     run.state === "retrying" ||
     run.state === "verifying" ||
     run.state === "settling"
@@ -1232,6 +1306,7 @@ async function resumeRun(
     // Walk the legal path up to `settling` (opened/retrying -> verifying ->
     // settling), as a fresh run would: the table in state.ts stays the guard.
     const enterSettling = async (): Promise<Outcome<void>> => {
+      if (run.state === "funded") return context.advance("settling");
       if (run.state === "opened" || run.state === "retrying") {
         const verifying = await context.advance("verifying");
         if (!verifying.ok) return verifying;
@@ -1242,6 +1317,9 @@ async function resumeRun(
 
     let ref: SettlementRef | undefined;
     if (found.value) {
+      if (corridor.source.protocol !== "prefunded" && !run.sourceTransactionId) {
+        return conflict("an existing settlement has no recorded source deposit reference");
+      }
       // A payment matching this exact request already exists: money moved
       // before the crash, so do not submit again.
       const entered = await enterSettling();
@@ -1271,7 +1349,7 @@ async function resumeRun(
           retryable: false,
         });
       }
-      if (deps.gate) {
+      if (deps.gate && run.state !== "funded") {
         // The gate needs the live quote and opened transaction, which a resumed
         // run no longer holds; never submit past a gate that cannot be re-run.
         return conflict(
@@ -1281,6 +1359,31 @@ async function resumeRun(
       if (route.receiving.capabilities().kyc !== "none") {
         const compliance = await comply(route.receiving, intent, corridor);
         if (!compliance.ok) return context.die(compliance.error);
+      }
+      if (corridor.source.protocol !== "prefunded" && !run.sourceTransactionId) {
+        if (!route.source) return conflict("source adapter is unavailable");
+        if (run.state === "opened" || run.state === "retrying") {
+          const verifying = await context.advance("verifying");
+          if (!verifying.ok) return context.die(verifying.error);
+        }
+        if (run.state !== "verifying") return conflict("cannot safely enter source funding");
+        const funding = await context.advance("funding");
+        if (!funding.ok) return context.die(funding.error);
+        const deposit = await route.source.openDeposit(intent, corridor);
+        if (!deposit.ok) return context.finishFailure(deposit.error);
+        run.sourceTransactionId = deposit.value.transactionId;
+        run.version += 1;
+        await store.put(run);
+        const funded = await waitForSourceDeposit(route.source, run.sourceTransactionId, {
+          now,
+          sleep,
+          deadlineMs: now() + corridor.recovery.timeout_seconds * 1000,
+          pollMs,
+          stallThreshold,
+        });
+        if (!funded.ok) return context.finishFailure(funded.error);
+        const markedFunded = await context.advance("funded");
+        if (!markedFunded.ok) return context.die(markedFunded.error);
       }
       const entered = await enterSettling();
       if (!entered.ok) return context.die(entered.error);
