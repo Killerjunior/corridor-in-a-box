@@ -53,7 +53,11 @@ import {
   watchRefund,
   settleQuoteProblem,
 } from "./verbs";
-import type { AnchorAdapter, SourceAdapter, TransactionStatus } from "@corridor/adapter-kit";
+import type {
+  AnchorAdapter,
+  SourceAnchorAdapter,
+  TransactionStatus,
+} from "@corridor/adapter-kit";
 import { defaultStrategies } from "./ports";
 import { checkCompatibility } from "./compat";
 import {
@@ -540,6 +544,46 @@ export async function execute(
     if (!t.ok) return die(t.error);
   }
 
+  // Keep dry runs value-free: they never open a source deposit.
+  if (opts.dryRun && corridor.source.protocol !== "prefunded") {
+    return die({
+      code: "DRY_RUN_COMPLETE",
+      message:
+        "dry run stopped before source funding; non-prefunded gate checks require a funded treasury",
+      retryable: false,
+      cause: { dryRun: true, checks: [] },
+    });
+  }
+
+  // Source funding precedes the destination balance/gate checks so the
+  // treasury is actually funded when those checks inspect its balance.
+  if (corridor.source.protocol !== "prefunded") {
+    if (!route.sending) {
+      return die({
+        code: "ENGINE_MISCONFIGURED",
+        message: `corridor ${corridor.id} requires a sending adapter for protocol ${corridor.source.protocol}`,
+        retryable: false,
+      });
+    }
+    const funding = await advance("funding");
+    if (!funding.ok) return die(funding.error);
+    const deposit = await route.sending.openDeposit(intent, corridor);
+    if (!deposit.ok) return finishFailure(deposit.error);
+    run.sourceTransactionId = deposit.value.transactionId;
+    run.version += 1;
+    await store.put(run);
+    const funded = await waitForSourceDeposit(route.sending, run.sourceTransactionId, {
+      now,
+      sleep,
+      deadlineMs: now() + corridor.recovery.timeout_seconds * 1000,
+      pollMs,
+      stallThreshold,
+    });
+    if (!funded.ok) return finishFailure(funded.error);
+    const markedFunded = await advance("funded");
+    if (!markedFunded.ok) return die(markedFunded.error);
+  }
+
   // The whole settle+reconcile phase must finish inside the corridor's timeout.
   const deadlineMs = now() + corridor.recovery.timeout_seconds * 1000;
 
@@ -561,11 +605,13 @@ export async function execute(
     // quote's price with no error. There's no "retry into a fresh quote"
     // step in this loop, so once expired there's nothing safe to retry into.
     if (q.value.firm && q.value.expiresAt <= now()) {
-      return finishFailure({
+      const expired = {
         code: "QUOTE_EXPIRED",
         message: `quote ${q.value.id} expired during retry`,
         retryable: false,
-      });
+      } as const;
+      if (run.sourceTransactionId) return context.holdAndStop(expired);
+      return finishFailure(expired);
     }
 
     // The same check settle() makes, done here too so a bad quote dies before the run ever reaches
@@ -591,11 +637,13 @@ export async function execute(
       } catch (e) {
         // Record the attempt at the gate so the audit trail shows where it died.
         await advance("verifying");
-        return die({
+        const gateError = {
           code: "SETTLEMENT_FAILED",
           message: e instanceof Error ? e.message : String(e),
           retryable: false,
-        });
+        } as const;
+        if (run.sourceTransactionId) return context.holdAndStop(gateError);
+        return die(gateError);
       }
       gateChecks = gateResult.results;
       for (const check of gateChecks) {
@@ -610,14 +658,13 @@ export async function execute(
       }
       if (!gateResult.passed) {
         const failure = gateChecks.find((r) => !r.passed)!;
-        return die(
-          {
-            code: failure.code ?? "SETTLEMENT_FAILED",
-            message: failure.detail,
-            retryable: false,
-          },
-          gateChecks,
-        );
+        const gateError = {
+          code: failure.code ?? "SETTLEMENT_FAILED",
+          message: failure.detail,
+          retryable: false,
+        } as const;
+        if (run.sourceTransactionId) return context.holdAndStop(gateError);
+        return die(gateError, gateChecks);
       }
     } else {
       const skippedCheck: CheckResult = {
@@ -663,34 +710,16 @@ export async function execute(
       );
     }
 
-    // The pre-settle gate has passed, so it is now safe to on-ramp the source
-    // funds. Persist the source reference before polling; a funded resume goes
-    // straight to settlement and can never open another deposit.
-    if (corridor.source.protocol !== "prefunded" && !run.sourceTransactionId) {
-      if (!route.source) {
-        return die({
-          code: "ENGINE_MISCONFIGURED",
-          message: `corridor ${corridor.id} requires a source adapter for protocol ${corridor.source.protocol}`,
-          retryable: false,
-        });
-      }
-      const funding = await advance("funding");
-      if (!funding.ok) return die(funding.error);
-      const deposit = await route.source.openDeposit(intent, corridor);
-      if (!deposit.ok) return finishFailure(deposit.error);
-      run.sourceTransactionId = deposit.value.transactionId;
-      run.version += 1;
-      await store.put(run);
-      const funded = await waitForSourceDeposit(route.source, run.sourceTransactionId, {
-        now,
-        sleep,
-        deadlineMs,
-        pollMs,
-        stallThreshold,
-      });
-      if (!funded.ok) return finishFailure(funded.error);
-      const markedFunded = await advance("funded");
-      if (!markedFunded.ok) return die(markedFunded.error);
+    // Funding can take long enough for a firm destination quote to expire.
+    // Check again after the gate and immediately before settlement.
+    if (q.value.firm && q.value.expiresAt <= now()) {
+      const expired = {
+        code: "QUOTE_EXPIRED" as const,
+        message: `quote ${q.value.id} expired before settlement after source funding`,
+        retryable: false,
+      };
+      if (run.sourceTransactionId) return context.holdAndStop(expired);
+      return finishFailure(expired);
     }
 
     {
@@ -784,7 +813,7 @@ export async function execute(
 }
 
 async function waitForSourceDeposit(
-  source: SourceAdapter,
+  source: SourceAnchorAdapter,
   transactionId: string,
   opts: {
     now: () => number;
@@ -1251,18 +1280,18 @@ async function resumeRun(
   }
 
   if (run.state === "funding") {
-    if (!route.source) return conflict("source adapter is unavailable");
+    if (!route.sending) return conflict("source adapter is unavailable");
     if (!run.sourceTransactionId) {
       // The adapter contract requires idempotency by the run key. This covers
       // a crash after the anchor accepted openDeposit but before we persisted
       // the returned transaction id.
-      const deposit = await route.source.openDeposit(intent, corridor);
+      const deposit = await route.sending.openDeposit(intent, corridor);
       if (!deposit.ok) return context.finishFailure(deposit.error);
       run.sourceTransactionId = deposit.value.transactionId;
       run.version += 1;
       await store.put(run);
     }
-    const funded = await waitForSourceDeposit(route.source, run.sourceTransactionId, {
+    const funded = await waitForSourceDeposit(route.sending, run.sourceTransactionId, {
       now,
       sleep,
       deadlineMs: now() + corridor.recovery.timeout_seconds * 1000,
@@ -1272,6 +1301,15 @@ async function resumeRun(
     if (!funded.ok) return context.finishFailure(funded.error);
     const advanced = await context.advance("funded");
     if (!advanced.ok) return advanced;
+  }
+
+  if (run.state === "funded" && deps.gate) {
+    // `funded` is before the destination gate. The persisted row does not
+    // contain the full quote/open objects needed to safely reconstruct its
+    // context, so never settle through a gate that cannot be re-evaluated.
+    return conflict(
+      "pre-settle gate cannot be re-evaluated on resume; operator review needed",
+    );
   }
 
   if (
@@ -1290,6 +1328,13 @@ async function resumeRun(
     ) {
       return conflict("persisted quote/open data is incomplete");
     }
+    if (run.state === "funded" && run.quoteFirm && run.quoteExpiresAt <= now()) {
+      return context.holdAndStop({
+        code: "QUOTE_EXPIRED",
+        message: `stored quote ${run.quoteId ?? "(unknown)"} expired during source funding`,
+        retryable: false,
+      });
+    }
     if (!deps.submitter.findExisting) {
       return conflict("settlement submitter does not support findExisting");
     }
@@ -1306,7 +1351,10 @@ async function resumeRun(
     // Walk the legal path up to `settling` (opened/retrying -> verifying ->
     // settling), as a fresh run would: the table in state.ts stays the guard.
     const enterSettling = async (): Promise<Outcome<void>> => {
-      if (run.state === "funded") return context.advance("settling");
+      if (run.state === "funded") {
+        const verifying = await context.advance("verifying");
+        if (!verifying.ok) return verifying;
+      }
       if (run.state === "opened" || run.state === "retrying") {
         const verifying = await context.advance("verifying");
         if (!verifying.ok) return verifying;
@@ -1349,7 +1397,7 @@ async function resumeRun(
           retryable: false,
         });
       }
-      if (deps.gate && run.state !== "funded") {
+      if (deps.gate) {
         // The gate needs the live quote and opened transaction, which a resumed
         // run no longer holds; never submit past a gate that cannot be re-run.
         return conflict(
@@ -1361,20 +1409,16 @@ async function resumeRun(
         if (!compliance.ok) return context.die(compliance.error);
       }
       if (corridor.source.protocol !== "prefunded" && !run.sourceTransactionId) {
-        if (!route.source) return conflict("source adapter is unavailable");
-        if (run.state === "opened" || run.state === "retrying") {
-          const verifying = await context.advance("verifying");
-          if (!verifying.ok) return context.die(verifying.error);
-        }
-        if (run.state !== "verifying") return conflict("cannot safely enter source funding");
+        if (!route.sending) return conflict("source adapter is unavailable");
+        if (run.state !== "opened") return conflict("cannot safely enter source funding");
         const funding = await context.advance("funding");
         if (!funding.ok) return context.die(funding.error);
-        const deposit = await route.source.openDeposit(intent, corridor);
+        const deposit = await route.sending.openDeposit(intent, corridor);
         if (!deposit.ok) return context.finishFailure(deposit.error);
         run.sourceTransactionId = deposit.value.transactionId;
         run.version += 1;
         await store.put(run);
-        const funded = await waitForSourceDeposit(route.source, run.sourceTransactionId, {
+        const funded = await waitForSourceDeposit(route.sending, run.sourceTransactionId, {
           now,
           sleep,
           deadlineMs: now() + corridor.recovery.timeout_seconds * 1000,
@@ -1384,6 +1428,20 @@ async function resumeRun(
         if (!funded.ok) return context.finishFailure(funded.error);
         const markedFunded = await context.advance("funded");
         if (!markedFunded.ok) return context.die(markedFunded.error);
+      }
+      if (run.quoteFirm && run.quoteExpiresAt <= now()) {
+        if (run.sourceTransactionId) {
+          return context.holdAndStop({
+            code: "QUOTE_EXPIRED",
+            message: `stored quote ${run.quoteId ?? "(unknown)"} expired before settlement`,
+            retryable: false,
+          });
+        }
+        return context.finishFailure({
+          code: "QUOTE_EXPIRED",
+          message: `stored quote ${run.quoteId ?? "(unknown)"} expired before settlement`,
+          retryable: false,
+        });
       }
       const entered = await enterSettling();
       if (!entered.ok) return context.die(entered.error);

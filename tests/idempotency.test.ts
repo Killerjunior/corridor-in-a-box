@@ -308,6 +308,31 @@ describe("state round-trips", () => {
     });
     expect((await store.get("k-source"))?.sourceTransactionId).toBe("source-deposit-1");
   });
+
+  it("in-memory store never erases or replaces a source deposit reference", async () => {
+    const store = new InMemoryIdempotencyStore();
+    await store.put({
+      idempotencyKey: "k-source-keep",
+      corridorId: "c",
+      state: "funding",
+      version: 2,
+      sourceTransactionId: "source-deposit-1",
+    });
+    await store.put({
+      idempotencyKey: "k-source-keep",
+      corridorId: "c",
+      state: "funded",
+      version: 3,
+    });
+    await store.put({
+      idempotencyKey: "k-source-keep",
+      corridorId: "c",
+      state: "funded",
+      version: 4,
+      sourceTransactionId: "source-deposit-2",
+    });
+    expect((await store.get("k-source-keep"))?.sourceTransactionId).toBe("source-deposit-1");
+  });
 });
 
 describe("hasRequestedRefund", () => {

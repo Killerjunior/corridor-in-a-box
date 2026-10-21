@@ -196,7 +196,7 @@ describe("state machine structure", () => {
     // with a single entrance, "did the gate run?" is answerable from the table
     // alone rather than by reading run.ts.
     const entrances = ALL.filter((s) => canTransition(s, "settling")).sort();
-    expect(entrances).toEqual(["funded", "verifying"]);
+    expect(entrances).toEqual(["verifying"]);
   });
 
   it("retrying re-enters settling only through verifying", () => {
@@ -228,13 +228,13 @@ describe("state machine structure", () => {
     // Its only successors are `settling` and `failed`: a gate refusal is a
     // terminal-bound `failed`, never `recovering`, because no money has moved
     // and there is nothing to unwind.
-    expect(successors("verifying").sort()).toEqual(["failed", "funding", "settling"]);
-    expect(canTransition("verifying", "recovering")).toBe(false);
+    expect(successors("verifying").sort()).toEqual(["failed", "recovering", "settling"]);
+    expect(canTransition("verifying", "recovering")).toBe(true);
   });
 
   it("only opened, funded, and retrying reach verifying", () => {
     const entrances = ALL.filter((s) => canTransition(s, "verifying")).sort();
-    expect(entrances).toEqual(["opened", "retrying"]);
+    expect(entrances).toEqual(["funded", "opened", "retrying"]);
   });
 
   it("opened can no longer settle directly", () => {

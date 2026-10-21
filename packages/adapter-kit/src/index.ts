@@ -605,7 +605,7 @@ export interface AnchorAdapter {
  * after the source accepts the deposit but before its id is stored is safe to
  * resume.
  */
-export interface SourceAdapter {
+export interface SourceAnchorAdapter {
   openDeposit(
     intent: PaymentIntent,
     corridor: Corridor,
@@ -614,7 +614,9 @@ export interface SourceAdapter {
 }
 
 /** Configurable source adapter for engine tests. */
-export function createMockSourceAdapter(opts: { settled?: boolean } = {}): SourceAdapter {
+export function createMockSourceAdapter(
+  opts: { settled?: boolean } = {},
+): SourceAnchorAdapter {
   let counter = 0;
   const deposits = new Map<string, boolean>();
   const byKey = new Map<string, string>();

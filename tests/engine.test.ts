@@ -97,7 +97,7 @@ describe("engine.execute", () => {
       ...deps(),
       resolver: {
         async resolve() {
-          return { receiving, source, trust: "manifest" as const };
+          return { receiving, sending: source, trust: "manifest" as const };
         },
       },
     });
@@ -609,7 +609,7 @@ describe("engine crash resume states", () => {
       idempotency: store,
       resolver: {
         async resolve() {
-          return { receiving, source, trust: "manifest" as const };
+          return { receiving, sending: source, trust: "manifest" as const };
         },
       },
     });
@@ -642,7 +642,7 @@ describe("engine crash resume states", () => {
         idempotency: store,
         resolver: {
           async resolve() {
-            return { receiving, source, trust: "manifest" as const };
+            return { receiving, sending: source, trust: "manifest" as const };
           },
         },
       });

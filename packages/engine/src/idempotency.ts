@@ -130,7 +130,13 @@ export class InMemoryIdempotencyStore implements IdempotencyStore {
   }
 
   async put(run: StoredRun): Promise<void> {
-    this.map.set(run.idempotencyKey, { ...run });
+    const existing = this.map.get(run.idempotencyKey);
+    this.map.set(run.idempotencyKey, {
+      ...run,
+      // Once a source deposit reference is written, an older or incomplete
+      // run snapshot must never erase it and permit a second deposit on resume.
+      sourceTransactionId: existing?.sourceTransactionId ?? run.sourceTransactionId,
+    });
   }
 
   // Single-threaded JS: the has/set pair has no await between them, so this is
