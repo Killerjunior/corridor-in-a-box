@@ -89,8 +89,8 @@ corridors/       the manifests — ALL corridor-specifics live here,
                  nowhere else
 contracts/       Soroban registry + attester contracts
 scripts/         reference-anchor.sh + assert-testnet-corridor.ts
-docs/            key management, bespoke adapters, "why not Anchor Platform",
-                 SEP coverage, operations, …
+docs/            threat model, key management, bespoke adapters,
+                 "why not Anchor Platform", SEP coverage, operations, …
 examples/        runnable end-to-end demo
 ```
 
@@ -267,6 +267,7 @@ operation, `stellar contract restore`); see the header of
 pnpm probe:anchor testanchor.stellar.org   # probe a live anchor, print the facts
 pnpm registry:read                         # read the registry via @corridor/registry
 pnpm registry:read --sep 24 --passed sep10_auth   # filter; --max-age and --json too
+pnpm registry:read --country MX --asset MXN        # who pays out MXN, declared in MX
 ATTESTER_SECRET=S… pnpm attest             # probe + submit both halves: bitmaps, then observed assets and declared country
 cd contracts && cargo test                 # 68 contract tests
 ```
